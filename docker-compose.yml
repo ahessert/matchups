@@ -1,0 +1,13 @@
+version: '3'
+services:
+  rstudio:
+    image: rocker/rstudio
+    environment:
+     - DISABLE_AUTH=true
+    ports:
+     - 8787:8787
+    volumes:
+     - .:/home/rstudio
+    command: 
+     - ["./container_setup.sh"]
+     

@@ -1,0 +1,222 @@
+---
+title: "Monte Carlo Results"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggthemes)
+
+source("./matchups_simulator.R")
+source("./monte_carlo_functions.R")
+```
+
+## Step 1: Team Scores distribution
+
+-  Create 50 teams with deterministic scores from 0 to 10 that we randomly selected from a normal distribution N(6,1.4) with a max of 10. 
+-  In this scenario most team scores are clustered in the middle and a few over-performers have some separation from the pack and each other. 
+-  This choice makes the best teams easier to find. The scores are ordered and rankings match the team name (i.e. "team_1","team_2", etc.).
+
+```{r, echo=FALSE, warning=FALSE}
+ggplot(teams_dt, aes(x=factor(team, levels = teams), y=team_score)) + 
+  geom_point() +
+  theme_clean() + 
+  theme(axis.text.x = element_text(angle = 90))  +
+  labs(title = "Team Scores") +
+  labs(x=NULL, y="Score")
+  
+
+ggplot(teams_dt, aes(x=team_score)) + 
+  stat_bin(binwidth = 0.5) +
+  theme_clean() +
+  labs(title = "Team Scores Distribution") +
+  labs(x="Team Score")
+```
+
+## Step 2: Dimension Scores
+
+-  We then give each team three scored dimensions that average to the team score. These scores are selected from a uniform distribution between 0 and 10. 
+-  This creates a large std. deviation around the team score, giving us less information from single dimension x team matchups than a tighter std.dev.  
+-  This choice is intentional because I wanted to reflect the reality of divergent dimensions (i.e. NPS_score=10 & Morale_score=0, Defense=9&Offense=3).
+
+```{r, echo=FALSE}
+ggplot(dimensions_dt, aes(x=factor(team, levels = teams), y=dimension_score)) + 
+  geom_point() +
+  stat_summary(fun=mean, geom="point", color="red") +
+  theme_clean() + 
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(title="Dimension Scores (Black) and Team Score (Red)") +
+  labs(x=NULL, y="Score")
+
+ggplot(dimensions_dt, aes(x=dimension_score-team_score, fill=dimension)) +
+  theme_clean() + 
+  geom_density(alpha=.5) + xlim(-10,10) +
+  labs(title = "Distribution of Dimension Team Score Differences") +
+  labs(subtitle = paste("N =", nrow(dimensions_dt))) +
+  labs(x="Difference between dimension and team score")
+
+```
+
+## Step 3: Matchups & Expert Scores
+
+Next we create a table of all matchup permutations. Each two team combination has a matchup for each dimension and the matchup has a deterministic margin given by the difference in the dimension score between the two teams. Ex: team4_DimA (8.2) vs. team26_DimA (2.9) - margin `8.2-2.9 = 5.3` 
+
+However, the *contest* data we sample in the end does not include a matchup margin. The contests are decided by human experts with imperfect knowledge, and there are five contest outcomes (blowout win, win, tie, loss, blowout loss). To simulate the contest data we generate five different scores from a normal distribution `N(mean=true margin, sd=3)` with bounds `-10 & 10` and average equal to the true matchup margin. If we tighten expert deviation from the true margin, then it will be easier to predict accurate rankings with less data. It is worth testing the variance of expert opinions in the relevant domain to more accurately set this parameter in the simulation.
+
+
+```{r, echo=FALSE}
+ggplot(experts_only_matchups, aes(x=expert_score-score_margin)) +
+  theme_clean() + 
+  geom_density() +
+  labs(x="Difference between expert margin and true margin") +
+  labs(title="Distribution of Expert Scores around True Matchup Margin") +
+  labs(subtitle = paste("N =", nrow(experts_only_matchups)))
+```
+
+
+---
+
+The testing environment is now set with our assumptions about Team score, Dimension score, and Expert knowledge distributions. That is our current best attempt to model the true state of the world. The degree to which these model is correct directly impacts the utility of this simulation.
+
+The work below encompasses the algorithm design for the eventual application. Included are: 
+-  Mapping score margins to contest outcomes
+-  Encoding contest outcomes for use in ranking algorithm
+-  Sampling/Selection method for choosing the most important contest
+
+---
+
+## Step 4: Mapping score margins
+
+We then map the contest margins to the broader outcome categories in order to replicate the coarser granularity of data that will be collected and available for predicting team rankings. 
+
+Contest margin to survey answer mapping:  
+-   [10 to 5)\t= Blowout Win 
+-   [5 to 1]\t= Win
+-   (1 to -1)\t= Tie
+-   [-1 to -5]\t= Loss
+-   (-5 to -10]\t= Blowout Loss
+
+## Step 5: Encoding contest outcomes
+
+Bradley Terry requires Binomial Outcomes so we map each outcome to a win/loss outcome.
+<\tb>
+Outcome\t W\t L
+Blowout Win\t 2\t 0
+Win\t 1\t 0
+Tie\t 1\t 1
+Loss\t 0\t 1
+Blowout Loss\t 0\t 2
+
+This mapping results in the following win count for each attribute in the top 5 teams.
+```{r, echo=FALSE}
+rbind(experts_only_matchups[, .(team=home_team, 
+                                dimension, 
+                                wins=home_win, 
+                                losses=away_win)],
+      experts_only_matchups[, .(team=away_team, 
+                                dimension, 
+                                wins=away_win, 
+                                losses=home_win)]) %>%
+  .[,lapply(.SD, sum), by=.(team,dimension)] %>% 
+  dcast(formula="team ~ dimension", value.var="wins") %>% .[1:5]
+```
+
+# Step 6: Bradley Terry Model
+
+Since all dimensions are now encoded into common win/loss records and each dimension is equally weighted in its contribution to team score, I drop the dimensions and aggregate the win/loss for each team. By taking every contest into account the Bradley Terry ability scores accurately reflect the top 5 ranking with high confidence.
+
+_Top 5 Ability Scores_
+
+```{r, echo=FALSE}
+ModelAll <- BTm(cbind(home_win, away_win), home_team, away_team, 
+                data=experts_only_matchups[,lapply(.SD, sum), 
+                                           by=.(home_team, away_team, dimension),
+                                           .SDcols=c("home_win", "away_win")])
+
+head(BTabilities(ModelAll))
+```
+
+The probability that Team A defeats Team B in a contest is:
+$$\frac{e^{ability_a}}{e^{ability_a}+e^{ability_b}}$$
+
+```{r, echo=FALSE}
+abilities <- BTabilities(ModelAll) %>% as.data.table(keep.rownames = T)
+setnames(abilities, c("home_team", "home_ability", "home_se"))
+abilities[,`:=` (home_team=factor(home_team, levels=teams), 
+                 cartesian="bombsaway")]
+
+y.abilities <- abilities %>% copy
+
+setnames(y.abilities, 
+         c("home_team", "home_ability", "home_se"),
+         c("away_team", "away_ability", "away_se"))
+
+matchup_abilities <- merge(abilities, y.abilities, 
+                           by="cartesian", allow.cartesian = T)
+
+matchup_abilities[, `:=` (win_prob=exp(home_ability) / (exp(home_ability) + exp(away_ability)),
+                          matchup_se=home_se+away_se)]
+```
+
+```{r, echo=FALSE}
+matchup_abilities %>% 
+  ggplot(aes(x=home_team, y=win_prob)) + 
+  geom_boxplot() + 
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(title="Win Probabilities Against All Potential Opponents by Team") +
+  labs(x=NULL, y="Win Probability")
+
+matchup_abilities %>% 
+  ggplot(aes(x=home_team, y=away_team, fill=win_prob>0.5)) + 
+  theme_clean() +
+  geom_tile() + 
+  scale_fill_discrete() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(x=NULL, y=NULL) +
+  labs(title = "Predicted Winner for Team Contests") +
+  labs(subtitle = "Bradley Terry Maximum Likelihood Estimates")
+  
+```
+
+Even with all information the Bradley Terry abilities are not perfect. There should be no entropy between the red and blue triangles in the tile plot above. This is likely due to closely clustered team scores and variance we intentionally introduced into the data. The misses are largely unimportant.
+
+
+## Step 7: Monte Carlo with random sampling
+
+```{r}
+monte_carlo_list <- lapply(X=seq(1000,18000,1000),  
+                           # Seq creates vector of sample sizes to simulate
+                         FUN=monte_carlo_random_bradley_terry, 
+                         # dt=experts_only_matchups[,.SD[1:2], by=matchup_key], iterations=100)
+                         dt=experts_only_matchups, iterations=100)
+
+monte_carlo_dt <- rbindlist(monte_carlo_list)
+
+
+monte_carlo_stats <- monte_carlo_dt[, lapply(.SD, mean), 
+                                    by=.(sample_size, sample_method)]
+```
+
+```{r, echo=FALSE}
+
+melted_stats <- melt(rbind(monte_carlo_stats, monte_carlo_stats_matchup_cap), 
+                     id.vars=c("sample_size","sample_method"), 
+                     measure.vars=3:6,
+                     variable.name = "stat")
+
+melted_stats[, stat_type:=ifelse(stat %in% c("pct_top5_match", "winner_match"), "Percent Matching", "Standard Errors")]
+
+ggplot(melted_stats[(stat_type=="Percent Matching")]) +
+  aes(x=sample_size, y=value, color=stat) +
+  geom_point() + 
+  geom_line() +
+  theme_clean() +
+  labs(title="Monte Carlo Stats by Sample Size - Sample Method = Random") +
+  labs(subtitle = paste("Unique Contests = ", nrow(experts_only_matchups), ": Iterations per sample = 100")) +
+  labs(x="Sample Size") +
+  facet_wrap("~sample_method", nrow=2)
+       
+    
+```
+
+
